@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+wallet_trace_results.csv
+wallet_summary.json
