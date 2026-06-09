@@ -1,14 +1,9 @@
-"""find_insider_longs.py
-Map the money network around the 0x20c2 insider cluster on Arbitrum and find
-every CONNECTED wallet that has Hyperliquid LONG activity - whether the long is
-open NOW (flagged >= $49,000) or was opened earlier and already closed.
-
-Logic:
-  1. From the seed cluster, collect counterparties of USDC transfers >= $49k
-     (both directions), 2 hops deep. Binance / bridge / decoys are terminals.
-  2. For each connected wallet, query Hyperliquid: open positions + fill history.
-  3. Report: (A) open LONGs >= $49k, (B) wallets that opened LONGs before,
-     (C) connected HL traders currently flat.
+"""find_insider_longs.py  (v3)
+Follow the insider money network on Arbitrum up to 3 hops, SKIPPING exchange
+pools (Binance) because the trail is unattributable past them, and only
+following the biggest outflows of any pool-like node. For every connected,
+non-exchange wallet, check Hyperliquid: open LONGs (flagged >= $49k) and
+historically opened longs.
 
 Needs a free Etherscan API key (https://etherscan.io/apis). No pip install.
 Run:  python find_insider_longs.py
@@ -18,16 +13,18 @@ import time
 import datetime
 import urllib.request
 import urllib.parse
-from collections import defaultdict
+from collections import defaultdict, deque
 
 ETHERSCAN_V2 = "https://api.etherscan.io/v2/api"
 HL = "https://api.hyperliquid.xyz/info"
 ARB = 42161
 
 USDC_MIN = 49000.0        # follow USDC transfers >= this
-LONG_MIN_USD = 49000.0    # flag open LONGs with position value >= this
-HOPS = 2
-MAX_SCAN = 100            # cap candidates scanned on HL
+LONG_MIN_USD = 49000.0    # flag open LONGs >= this position value
+HOPS = 3
+MAX_FETCH = 70            # max Etherscan address-pulls (rate/quota guard)
+POOL_FANOUT = 30          # > this many USDC counterparties => treat as pool
+POOL_TOP_KEEP = 6         # for a pool, only follow its biggest N outflows
 USDC_SYMBOLS = {"USDC", "USDC.e"}
 
 SEEDS = [
@@ -38,7 +35,7 @@ SEEDS = [
     "0x1e772565d78761d67796643941597c9f452da0d9",
 ]
 
-# Terminals: exchanges / bridge / decoys -> never insider traders, never expand.
+# Exchange pools / bridge / decoys -> terminal: never expand, never a candidate.
 TERMINALS = {
     "0xee7ae85f2fe2239e27d9c1e23fffe168d63b4055": "Binance HW34",
     "0xb38e8c17e38363af6ebdcb3dae12e0243582891d": "Binance",
@@ -54,7 +51,6 @@ TERMINALS = {
     "0x40e7fb7ddcaee8e4bcb66180a350c00b3c657e56": "DECOY",
     "0x2df17470c5de6a5d2d41feb8fcf5fb0deeb43df7": "phishing",
 }
-SEED_SET = set(s.lower() for s in SEEDS)
 
 
 def get_json(url):
@@ -62,12 +58,10 @@ def get_json(url):
         return json.load(r)
 
 
-def hl_post(req_type, addr, extra=None):
-    payload = {"type": req_type, "user": addr}
-    if extra:
-        payload.update(extra)
-    req = urllib.request.Request(HL, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
+def hl_post(req_type, addr):
+    req = urllib.request.Request(
+        HL, data=json.dumps({"type": req_type, "user": addr}).encode(),
+        headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.load(r)
@@ -75,8 +69,8 @@ def hl_post(req_type, addr, extra=None):
         return None
 
 
-def usdc_edges(addr, key):
-    """Return list of (other_addr, amount, direction) for USDC tx >= USDC_MIN."""
+def usdc_out_edges(addr, key):
+    """USDC transfers FROM addr >= USDC_MIN -> list of (to_addr, amount)."""
     params = urllib.parse.urlencode({
         "chainid": ARB, "module": "account", "action": "tokentx",
         "address": addr, "page": 1, "offset": 1000, "sort": "desc", "apikey": key,
@@ -91,23 +85,20 @@ def usdc_edges(addr, key):
         if "rate" in str(data.get("result", "")).lower():
             time.sleep(1.2); continue
         return []
-    edges = []
+    out = []
     al = addr.lower()
     for tx in data.get("result", []):
         if tx.get("tokenSymbol") not in USDC_SYMBOLS:
+            continue
+        if tx.get("from", "").lower() != al:
             continue
         try:
             val = int(tx["value"]) / (10 ** int(tx.get("tokenDecimal", 6)))
         except Exception:
             continue
-        if val < USDC_MIN:
-            continue
-        frm, to = tx.get("from", "").lower(), tx.get("to", "").lower()
-        if frm == al and to:
-            edges.append((to, val, "out"))
-        elif to == al and frm:
-            edges.append((frm, val, "in"))
-    return edges
+        if val >= USDC_MIN and tx.get("to"):
+            out.append((tx["to"].lower(), val))
+    return out
 
 
 def ts(ms):
@@ -118,44 +109,55 @@ def main():
     key = input("Etherscan API key yapistir ve Enter: ").strip()
     if not key:
         print("Key bos, cikiliyor."); return
+    custom = input("Baska bir baslangic adresi? (bos birak = varsayilan kume): ").strip().lower()
+    seeds = [custom] if custom.startswith("0x") and len(custom) == 42 else SEEDS
 
-    print("\n[1] Para agi {} hop cikariliyor (>= ${:,.0f} USDC)...".format(HOPS, USDC_MIN))
-    flows = defaultdict(lambda: [0.0, 0])     # (from,to) -> [total, count]
-    received = defaultdict(float)             # addr -> max amount seen
-    frontier = list(SEED_SET)
-    seen = set(SEED_SET)
+    print("\n[1] Para agi {} hop takip ediliyor (havuzlar atlanir)...".format(HOPS))
+    received = defaultdict(float)
+    flows = defaultdict(lambda: [0.0, 0])
+    seen = set(seeds)
+    queue = deque((s, 0) for s in seeds)
+    fetched = 0
 
-    for hop in range(HOPS):
-        nxt = []
-        for addr in frontier:
-            for other, amt, direction in usdc_edges(addr, key):
-                if direction == "out":
-                    flows[(addr, other)][0] += amt
-                    flows[(addr, other)][1] += 1
-                received[other] = max(received[other], amt)
-                if other in TERMINALS:
-                    continue
-                if other not in seen:
-                    seen.add(other)
-                    nxt.append(other)
-            time.sleep(0.3)
-        frontier = nxt
+    while queue and fetched < MAX_FETCH:
+        addr, depth = queue.popleft()
+        if depth >= HOPS:
+            continue
+        edges = usdc_out_edges(addr, key)
+        fetched += 1
+        time.sleep(0.25)
 
-    # show aggregated top money destinations
-    print("\n   Paranin gittigi baslica adresler:")
-    top = sorted(flows.items(), key=lambda x: -x[1][0])[:15]
-    for (frm, to), (tot, cnt) in top:
+        agg = defaultdict(float)
+        for to_addr, amt in edges:
+            agg[to_addr] += amt
+            flows[(addr, to_addr)][0] += amt
+            flows[(addr, to_addr)][1] += 1
+            received[to_addr] = max(received[to_addr], amt)
+
+        items = sorted(agg.items(), key=lambda x: -x[1])
+        is_pool = len(agg) > POOL_FANOUT
+        if is_pool:
+            items = items[:POOL_TOP_KEEP]
+            print("   {} havuz-benzeri ({} alici) -> sadece en buyuk {} takip".format(
+                addr[:10] + "...", len(agg), POOL_TOP_KEEP))
+        for to_addr, amt in items:
+            if to_addr in TERMINALS or to_addr in seen:
+                continue
+            seen.add(to_addr)
+            queue.append((to_addr, depth + 1))
+
+    print("   ({} adres tarandi)".format(fetched))
+    print("\n   Baslica para akislari:")
+    for (frm, to), (tot, cnt) in sorted(flows.items(), key=lambda x: -x[1][0])[:15]:
         tag = TERMINALS.get(to, "")
-        print("     {} -> {} {}  TOPLAM {:,.0f} USDC ({} tx)".format(
+        print("     {} -> {} {}  {:,.0f} USDC ({}tx)".format(
             frm[:10] + "...", to[:12] + "...", "[" + tag + "]" if tag else "", tot, cnt))
 
-    candidates = [a for a in received
-                  if a not in SEED_SET and a not in TERMINALS]
+    candidates = [a for a in received if a not in TERMINALS and a not in set(seeds)]
     candidates.sort(key=lambda x: -received[x])
-    candidates = candidates[:MAX_SCAN]
-    print("\n[2] {} bagli cuzdan Hyperliquid'de taraniyor...".format(len(candidates)))
+    print("\n[2] {} bagli (borsa-disi) cuzdan Hyperliquid'de taraniyor...".format(len(candidates)))
 
-    open_longs, past_longs, flat_traders = [], [], []
+    open_longs, past_longs, flat = [], [], []
     for a in candidates:
         st = hl_post("clearinghouseState", a)
         time.sleep(0.12)
@@ -166,7 +168,7 @@ def main():
         fills = hl_post("userFills", a) or []
         time.sleep(0.12)
         if not positions and acct == 0 and not fills:
-            continue  # never touched Hyperliquid
+            continue
 
         cur_long = None
         for ap in positions:
@@ -174,11 +176,11 @@ def main():
             if float(p.get("szi", 0) or 0) > 0:
                 cur_long = (p.get("coin"), float(p.get("positionValue", 0) or 0),
                             p.get("entryPx"), float(p.get("unrealizedPnl", 0) or 0))
-        opened_longs = [f for f in fills if "Open Long" in f.get("dir", "")]
+        opened = [f for f in fills if "Open Long" in f.get("dir", "")]
 
-        print("\n  {}   (kumeden ~{:,.0f} USDC)".format(a, received[a]))
-        print("    HL value: {:,.0f} USD | fills: {} | Open-Long fills: {}".format(
-            acct, len(fills), len(opened_longs)))
+        print("\n  {}  (~{:,.0f} USDC aldi)".format(a, received[a]))
+        print("    HL value: {:,.0f} | fills: {} | Open-Long: {}".format(
+            acct, len(fills), len(opened)))
         for ap in positions:
             p = ap["position"]
             side = "LONG" if float(p.get("szi", 0) or 0) > 0 else "SHORT"
@@ -189,30 +191,25 @@ def main():
         if cur_long and cur_long[1] >= LONG_MIN_USD:
             print("      *** ACIK LONG >= $49k ***")
             open_longs.append((a, cur_long, received[a]))
-        elif opened_longs:
-            last = max(opened_longs, key=lambda x: x.get("time", 0))
-            print("      (gecmiste LONG acmis, son: {} {})".format(
-                ts(last.get("time", 0)), last.get("coin")))
+        elif opened:
+            last = max(opened, key=lambda x: x.get("time", 0))
             past_longs.append((a, last.get("coin"), ts(last.get("time", 0))))
         else:
-            flat_traders.append(a)
+            flat.append(a)
 
-    # ---- final report ----
     print("\n" + "=" * 58)
     print("A) ACIK LONG (>= $49,000) BAGLI CUZDANLAR:")
-    if open_longs:
-        for a, (coin, val, entry, pnl), rec in sorted(open_longs, key=lambda x: -x[1][1]):
-            print("   {}  {} value={:,.0f} entry={} uPnL={:,.0f}".format(a, coin, val, entry, pnl))
-    else:
+    for a, (coin, val, entry, pnl), rec in sorted(open_longs, key=lambda x: -x[1][1]):
+        print("   {}  {} value={:,.0f} entry={} uPnL={:,.0f}".format(a, coin, val, entry, pnl))
+    if not open_longs:
         print("   (yok)")
-    print("\nB) GECMISTE LONG ACMIS (simdi kapali) BAGLI CUZDANLAR:")
-    if past_longs:
-        for a, coin, d in past_longs:
-            print("   {}  son long: {} {}".format(a, coin, d))
-    else:
+    print("\nB) GECMISTE LONG ACMIS BAGLI CUZDANLAR:")
+    for a, coin, d in past_longs:
+        print("   {}  son long: {} {}".format(a, coin, d))
+    if not past_longs:
         print("   (yok)")
-    print("\nC) BAGLI HL TRADER (su an flat): {} adet".format(len(flat_traders)))
-    for a in flat_traders:
+    print("\nC) BAGLI HL TRADER (su an flat): {} adet".format(len(flat)))
+    for a in flat:
         print("   " + a)
     print("\nBitti.")
 
