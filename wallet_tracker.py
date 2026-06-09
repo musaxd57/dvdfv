@@ -288,19 +288,24 @@ LONG_CANDIDATES = [
 
 
 def scan_cluster_longs(addresses=LONG_CANDIDATES):
-    """For each cluster wallet, print open Hyperliquid positions and flag LONGs."""
+    """For each cluster wallet: open positions + recent fill DIRECTION
+    ("Open Long" / "Close Short" ...). Fills directly answer 'who opened a long'."""
     print("\n" + "=" * 64)
-    print("LONG-HUNT: scanning cluster wallets for open Hyperliquid positions")
+    print("LONG-HUNT: scanning cluster wallets (positions + fill direction)")
     print("=" * 64)
     findings = {}
     for addr in addresses:
         perp = hl_post({"type": "clearinghouseState", "user": addr}) or {}
         time.sleep(0.2)
+        fills = hl_post({"type": "userFills", "user": addr}) or []
+        time.sleep(0.2)
+
         positions = perp.get("assetPositions", [])
         acct = float(perp.get("marginSummary", {}).get("accountValue", 0) or 0)
         longs = []
         print(f"\n  {label_for(addr)}  ({addr})")
         print(f"    HL account value: ${acct:,.2f}")
+
         if not positions:
             print("    no open perp positions")
         for ap in positions:
@@ -314,11 +319,33 @@ def scan_cluster_longs(addresses=LONG_CANDIDATES):
             if side == "LONG":
                 longs.append({"coin": p.get("coin"), "value": p.get("positionValue"),
                               "entry": p.get("entryPx"), "uPnl": pnl})
+
+        # Fill-direction breakdown: the `dir` field literally says the action.
+        dir_count = defaultdict(int)
+        open_longs = []
+        for f in fills:
+            d = f.get("dir", "?")
+            dir_count[d] += 1
+            if "Long" in d and "Open" in d:
+                open_longs.append(f)
+        if dir_count:
+            brk = ", ".join(f"{k}:{v}" for k, v in sorted(dir_count.items(), key=lambda x: -x[1]))
+            print(f"    fills({len(fills)}): {brk}")
+        # show the most recent Open Long events
+        for f in sorted(open_longs, key=lambda x: x.get("time", 0), reverse=True)[:5]:
+            t = time.strftime("%Y-%m-%d %H:%M", time.localtime(f.get("time", 0) / 1000))
+            print(f"      OPEN LONG  {f.get('coin'):>6}  px={f.get('px')}  sz={f.get('sz')}  {t}")
+
         if longs:
-            coins = ", ".join(l["coin"] for l in longs)
-            print(f"    *** OPEN LONG(S): {coins}  <-- candidate confirmed ***")
-        findings[addr] = {"account_value": acct, "longs": longs,
-                          "label": label_for(addr)}
+            print(f"    *** CURRENTLY LONG: {', '.join(l['coin'] for l in longs)}  <-- confirmed ***")
+        elif open_longs:
+            print(f"    *** opened longs historically ({len(open_longs)} fills) but flat now ***")
+
+        findings[addr] = {
+            "label": label_for(addr), "account_value": acct,
+            "current_longs": longs, "open_long_fill_count": len(open_longs),
+            "fill_dir_breakdown": dict(dir_count),
+        }
     return findings
 
 
@@ -388,7 +415,13 @@ def main():
     if not args.no_hl:
         hl_summary = hyperliquid_report(target)
     if args.longs:
-        long_findings = scan_cluster_longs()
+        # scan the known cluster PLUS every address that RECEIVED funds in the
+        # trace -> "money was sent here, was a long opened here?"
+        received = {e["to_addr"] for e in edges
+                    if e["to_addr"] and e["amount"] >= BIG_TRANSFER
+                    and not is_terminal(e["to_addr"])}
+        candidates = list(dict.fromkeys(LONG_CANDIDATES + sorted(received)))
+        long_findings = scan_cluster_longs(candidates)
 
     # ---- Reports ----
     print("\n" + "=" * 64)
