@@ -19,12 +19,30 @@ target's **Hyperliquid** perp/spot state plus its deposit/withdrawal ledger.
 
 ## Setup
 
+Get a free key at https://etherscan.io/apis. The Hyperliquid Info API needs no key.
+
+### Windows (your `'pip' is not recognized` error = Python not installed / not on PATH)
+
+1. Install Python from https://www.python.org/downloads/ — **tick "Add python.exe to PATH"** in the installer.
+2. Open a **new** Command Prompt (`cmd`) in the project folder, then:
+
+```bat
+py -m pip install -r requirements.txt
+copy .env.example .env
+notepad .env            REM paste your ETHERSCAN_API_KEY, save, close
+py wallet_tracker.py
+py wallet_tracker.py --longs
+```
+
+> Use `py` (the Windows Python launcher) instead of `python`/`pip` if those aren't found.
+
+### macOS / Linux
+
 ```bash
 pip install -r requirements.txt
 cp .env.example .env       # then put your ETHERSCAN_API_KEY in .env
+python wallet_tracker.py
 ```
-
-Get a free key at https://etherscan.io/apis. The Hyperliquid Info API needs no key.
 
 > The legacy `api.arbiscan.io` host is deprecated — this tool uses
 > `https://api.etherscan.io/v2/api?chainid=42161` instead. A single Etherscan
@@ -38,18 +56,42 @@ python wallet_tracker.py --target 0xABC... --depth 4
 python wallet_tracker.py --no-hl              # skip Hyperliquid
 ```
 
-## Investigation context (this repo's default target)
+## Investigation context (owner cluster, from the CSV fund-flow)
 
-| Address | Role |
+Real money is **USDC only**. The flow consolidates through one funnel into Binance:
+
+```
+Hyperliquid  <->  0x20c2…44f5 (MAIN, public ETH-short whale) ─┐
+                  0x40e7f70D…7e56 (2nd big wallet) ───────────┤
+                  0x8ad9765C…34e1 ───────────────────────────┼─► 0x511cCDe9…82cB ─► Binance HW34
+                  0x1e772565d…a0D9 ──────────────────────────┘      (funnel)         (trail ends)
+```
+
+~$19M was cashed out to **Binance Hot Wallet 34** (`0xEe7aE85f…4055`) Mar–May 2026.
+A Binance hot wallet is a shared omnibus address — once funds land there they merge
+into Binance's books, so on-chain tracing ends. Going further needs Binance KYC
+records (legal process), not OSINT.
+
+### Address-poisoning decoys (ignore these — they are NOT real)
+
+| Decoy | Mimics |
 |---|---|
-| `0x20c2d95a3dfdca9e9ad12794d5fa6fad99da44f5` | **Target** — the well-known Hyperliquid 50x ETH-short whale |
-| `0x511cCDe9444216EFC26e5744a0355EaEBAeA82cB` | First hop — unlabeled intermediary EOA |
-| `0xEe7aE85f2Fe2239E27D9c1E23fFFe168D63b4055` | **Binance: Hot Wallet 34** — on-chain trail ends here |
+| `0x511cd5A8…03e82Cb` (fake "U5DC" token) | `0x511cCDe9…BaeA82cB` funnel |
+| `0xee7a8a18…993b4055` | `0xEe7aE85f…D63b4055` Binance HW34 |
+| `0x40e7fb7d…0B3C657E56` | `0x40e7f70D…3c657e56` feeder |
+| token `U5DC` | real `USDC` |
 
-**Note on the trail ending:** a Binance hot wallet is a shared omnibus deposit
-address. Once funds land there they merge into Binance's internal books, so a
-block explorer cannot follow them further. Continuing past that point requires
-Binance's KYC/account records (i.e. a legal/exchange process), not OSINT.
+### Hunting a hidden LONG
+
+The owner is famous for ETH **shorts** on the MAIN wallet. To check whether he
+flipped **long** (e.g. during a BTC/ETH rally) on a less-watched sister wallet:
+
+```bash
+python wallet_tracker.py --longs
+```
+
+This queries Hyperliquid `clearinghouseState` for every cluster wallet and flags
+any open LONG. Prime suspect: `0x40e7f70D…7e56`.
 
 ## Why it must be run locally / on an unrestricted network
 

@@ -58,9 +58,19 @@ HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info"
 # Known address labels. Lower-cased keys. Addresses flagged terminal=True are
 # NOT expanded further (exchange omnibus / bridges -> on-chain trail ends).
 KNOWN_LABELS = {
-    # --- target & hops in this investigation ---
-    "0x20c2d95a3dfdca9e9ad12794d5fa6fad99da44f5": ("TARGET_ETH_Short_Whale", False),
-    "0x511ccde9444216efc26e5744a0355eaebaaea82cb": ("HOP_1_Intermediary", False),
+    # --- OWNER CLUSTER (same entity, inferred from the CSV fund-flow) ---
+    "0x20c2d95a3dfdca9e9ad12794d5fa6fad99da44f5": ("MAIN_HL_Whale", False),       # public ETH-short whale
+    "0x40e7f70d8c5dbf7b27dab33ed826484b3c657e56": ("CLUSTER_BigFeeder_2", False),  # 2nd big wallet -> funnel
+    "0x511ccde9444216efc26e5744a0355eaebaaea82cb": ("CLUSTER_Funnel_to_Binance", False),
+    "0x8ad9765c8613d3beb6fbfa9df44e5bd1de4934e1": ("CLUSTER_Feeder_3", False),
+    "0x1e772565d78761d67796643941597c9f452da0d9": ("CLUSTER_Feeder_4", False),
+    "0x9e0dee69b9e8efb9ab6408ad4a3e133db2da283b": ("CLUSTER_TWcoin_Counterparty", False),
+
+    # --- ADDRESS-POISONING DECOYS (NOT real; lookalikes / fake "U5DC" token) ---
+    "0x511cd5a8644ce7cc96eaab1938e873f4e03e82cb": ("DECOY_fake_funnel", True),
+    "0xee7a8a1898bd47592aa1062e4f60608c993b4055": ("DECOY_fake_binance", True),
+    "0x40e7fb7ddcaee8e4bcb66180a350c00b3c657e56": ("DECOY_fake_feeder", True),
+    "0x2df17470c5de6a5d2d41feb8fcf5fb0deeb43df7": ("DECOY_phishing", True),
 
     # --- Binance (terminal: omnibus exchange wallets, can't trace past) ---
     "0xee7ae85f2fe2239e27d9c1e23fffe168d63b4055": ("Binance_Hot_Wallet_34", True),
@@ -265,6 +275,53 @@ def hyperliquid_report(address):
     return summary
 
 
+# Cluster wallets to probe for a hidden LONG (ranked by likelihood). The owner is
+# famous for ETH SHORTS on the MAIN wallet; if he flipped long while BTC/ETH
+# rallied he most likely did it on a less-watched sister wallet.
+LONG_CANDIDATES = [
+    "0x40e7f70d8c5dbf7b27dab33ed826484b3c657e56",  # big 2nd wallet (prime suspect)
+    "0x20c2d95a3dfdca9e9ad12794d5fa6fad99da44f5",  # main - maybe flipped in place
+    "0x8ad9765c8613d3beb6fbfa9df44e5bd1de4934e1",
+    "0x1e772565d78761d67796643941597c9f452da0d9",
+    "0x9e0dee69b9e8efb9ab6408ad4a3e133db2da283b",
+]
+
+
+def scan_cluster_longs(addresses=LONG_CANDIDATES):
+    """For each cluster wallet, print open Hyperliquid positions and flag LONGs."""
+    print("\n" + "=" * 64)
+    print("LONG-HUNT: scanning cluster wallets for open Hyperliquid positions")
+    print("=" * 64)
+    findings = {}
+    for addr in addresses:
+        perp = hl_post({"type": "clearinghouseState", "user": addr}) or {}
+        time.sleep(0.2)
+        positions = perp.get("assetPositions", [])
+        acct = float(perp.get("marginSummary", {}).get("accountValue", 0) or 0)
+        longs = []
+        print(f"\n  {label_for(addr)}  ({addr})")
+        print(f"    HL account value: ${acct:,.2f}")
+        if not positions:
+            print("    no open perp positions")
+        for ap in positions:
+            p = ap.get("position", {})
+            szi = float(p.get("szi", 0))
+            side = "LONG" if szi > 0 else "SHORT"
+            pnl = float(p.get("unrealizedPnl", 0) or 0)
+            print(f"    -> {p.get('coin'):>6} {side:<5} value=${float(p.get('positionValue',0) or 0):,.0f} "
+                  f"entry={p.get('entryPx')} uPnL=${pnl:,.0f} "
+                  f"lev={p.get('leverage',{}).get('value')}x")
+            if side == "LONG":
+                longs.append({"coin": p.get("coin"), "value": p.get("positionValue"),
+                              "entry": p.get("entryPx"), "uPnl": pnl})
+        if longs:
+            coins = ", ".join(l["coin"] for l in longs)
+            print(f"    *** OPEN LONG(S): {coins}  <-- candidate confirmed ***")
+        findings[addr] = {"account_value": acct, "longs": longs,
+                          "label": label_for(addr)}
+    return findings
+
+
 # ================================ BFS ========================================
 
 def trace(target, depth_limit):
@@ -310,6 +367,8 @@ def main():
     ap.add_argument("--target", default=TARGET, help="address to trace")
     ap.add_argument("--depth", type=int, default=DEPTH)
     ap.add_argument("--no-hl", action="store_true", help="skip Hyperliquid lookup")
+    ap.add_argument("--longs", action="store_true",
+                    help="scan all cluster wallets for open Hyperliquid LONG positions")
     args = ap.parse_args()
 
     target = args.target.lower()
@@ -325,8 +384,11 @@ def main():
 
     # ---- Hyperliquid ----
     hl_summary = {}
+    long_findings = {}
     if not args.no_hl:
         hl_summary = hyperliquid_report(target)
+    if args.longs:
+        long_findings = scan_cluster_longs()
 
     # ---- Reports ----
     print("\n" + "=" * 64)
@@ -364,6 +426,7 @@ def main():
         "total_outgoing_edges": len(edges),
         "unique_destinations": len({e["to_addr"] for e in edges}),
         "hyperliquid": hl_summary,
+        "long_hunt": long_findings,
     }
     with open("wallet_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
